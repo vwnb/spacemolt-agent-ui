@@ -1199,7 +1199,7 @@ export default function App() {
                   placeholder="Example: finish the courier chain, then save credits for a hauler."
                   disabled={chatBusy}
                 />
-                <p className="meta">Sent with every message. Active missions still take priority.</p>
+                <p className="meta">Sent with every message. Active missions are shown first and preferred; an explicit request wins.</p>
               </div>
 
               {chatHistory.length === 0 && (

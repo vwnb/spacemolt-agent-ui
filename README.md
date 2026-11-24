@@ -1,6 +1,6 @@
 # SpaceMolt Agent UI
 
-Vite + React + TypeScript frontend for the deployed SpaceMolt agent backend. It authenticates the human with Clerk, connects a pilot through SpaceMolt's browser login, and then lets the human talk to a backend agent that prioritizes missions and a pilot-defined objective through registered safe actions and approval-gated proposals.
+Vite + React + TypeScript frontend for the deployed SpaceMolt agent backend. It authenticates the human with Clerk, connects a pilot through SpaceMolt's browser login, and then lets the human talk to a backend agent that prefers active missions, then a pilot-defined objective, through registered safe actions and approval-gated proposals.
 
 ## Setup
 
@@ -39,7 +39,7 @@ All transient links, codes, generated passwords and the SpaceMolt `sessionId` li
 
 ## Pilot chat
 
-After connecting, the chat section sends messages to `POST /api/chat` with the in-memory `sessionId`, the last 20 messages, the selected provider/model from `GET /api/health`'s `llmProviders` and `llmModelOptionsByProvider`, and the editable personal objective. Provider/model choices are remembered in `localStorage` and restored after reload. The backend prefetches game state, asks the LLM for a reply plus at most four registered actions, executes safe actions immediately, and returns action results plus any proposals. The agent prioritizes active missions and the personal objective, and reports what changed after each meaningful batch.
+After connecting, the chat section sends messages to `POST /api/chat` with the in-memory `sessionId`, the last 20 messages, the selected provider/model from `GET /api/health`'s `llmProviders` and `llmModelOptionsByProvider`, and the editable personal objective. Provider/model choices are remembered in `localStorage` and restored after reload. The backend prefetches game state, asks the LLM for a reply plus at most four registered actions, executes safe actions immediately, and returns action results plus any proposals. The agent is told to prefer active missions over the personal objective unless the pilot explicitly asks otherwise, and reports what changed after each meaningful batch.
 
 Quick prompts cover the basic loop:
 
