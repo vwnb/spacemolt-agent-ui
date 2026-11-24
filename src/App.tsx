@@ -42,6 +42,13 @@ type ConnectResult = {
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
+const MAX_CHAT_HISTORY = 20;
+
+function trimChatHistory(history: ChatMessage[]): ChatMessage[] {
+  const recent = history.slice(-MAX_CHAT_HISTORY);
+  return recent[0]?.role === "assistant" ? recent.slice(1) : recent;
+}
+
 type ModelChoice = { id: string; label: string };
 
 type ProviderChoice = { key: string; label: string; envKey?: string; defaultModel?: string };
@@ -386,7 +393,7 @@ export default function App() {
       return;
     }
 
-    const next = [...chatHistory, { role: "user" as const, content: clean }];
+    const next = trimChatHistory([...chatHistory, { role: "user" as const, content: clean }]);
     setChatHistory(next);
     setChatInput("");
     setChatBusy(true);
@@ -401,7 +408,7 @@ export default function App() {
           message: clean,
           objective: objective.trim() || undefined,
           provider: selectedProvider || defaultProvider || undefined,
-          history: chatHistory,
+          history: next.slice(0, -1),
           model: selectedModel || undefined,
         }),
       });
@@ -416,14 +423,14 @@ export default function App() {
         : "";
       const reply = safeText(chat.reply);
       setPendingActions(pending);
-      setChatHistory([...next, {
+      setChatHistory(trimChatHistory([...next, {
         role: "assistant",
         content: `${reply === "—" ? "No reply." : reply}${details}${approvalNote}`,
-      }]);
+      }]));
       if (chat.error) setChatError(safeText(chat.error));
     } catch (err) {
       const messageText = err instanceof Error ? err.message : String(err);
-      setChatHistory([...next, { role: "assistant", content: `Error: ${messageText}` }]);
+      setChatHistory(trimChatHistory([...next, { role: "assistant", content: `Error: ${messageText}` }]));
       setChatError(messageText);
     } finally {
       setChatBusy(false);
