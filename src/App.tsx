@@ -47,14 +47,42 @@ type WorkingTask = { label: string; startedAt: number };
 type RetryRequest =
   | { kind: "chat"; message: string }
   | { kind: "execute"; actions: PendingAction[] }
-  | { kind: "action"; tool: string; action: string; args: Record<string, unknown> };
+  | { kind: "action"; tool: string; action: string; args: Record<string, unknown> }
+  | { kind: "route"; plan: RoutePlan };
+
+type RouteStep = { systemId: string; name?: string; jumps: number; kind?: "jump" | "travel" };
+
+type RoutePlan = {
+  destination: string;
+  steps: RouteStep[];
+  totalJumps: number;
+  targetSystem?: string;
+  targetPoi?: string;
+  targetPoiName?: string;
+  message?: string;
+  estimatedFuel?: number;
+  fuelAvailable?: number;
+};
+
+type RouteRun = {
+  plan: RoutePlan;
+  index: number;
+  status: "running" | "stopped" | "done" | "error";
+  error?: string;
+};
 
 type TransitLocation = {
   system?: unknown;
+  system_id?: unknown;
+  system_name?: unknown;
   poi?: unknown;
+  poi_id?: unknown;
+  poi_name?: unknown;
   in_transit?: unknown;
   transit_type?: unknown;
+  transit_dest_system_id?: unknown;
   transit_dest_system_name?: unknown;
+  transit_dest_poi_id?: unknown;
   transit_dest_poi_name?: unknown;
   transit_arrival_tick?: unknown;
 };
@@ -75,6 +103,7 @@ type GameActionRecord = {
   args: Record<string, unknown>;
   ok: boolean;
   result?: string;
+  structured?: unknown;
   error?: string;
 };
 
@@ -92,6 +121,7 @@ type ChatResult = {
   reply?: unknown;
   actions?: GameActionRecord[];
   pending_actions?: unknown;
+  routes?: unknown;
   context?: { hasStatus?: unknown; pilot?: unknown };
   error?: unknown;
 };
@@ -143,11 +173,106 @@ function isAbortError(err: unknown): boolean {
 function transitLabel(location: TransitLocation | null): string {
   if (!location || location.in_transit !== true) return "";
   const kind = safeText(location.transit_type);
-  const destination = safeText(location.transit_dest_system_name ?? location.transit_dest_poi_name ?? "destination");
+  const destination = safeText(
+    location.transit_dest_system_name
+    ?? location.transit_dest_system_id
+    ?? location.transit_dest_poi_name
+    ?? location.transit_dest_poi_id
+    ?? "destination",
+  );
   const rawTick = location.transit_arrival_tick;
   const tick = typeof rawTick === "number" ? rawTick : typeof rawTick === "string" ? Number(rawTick) : NaN;
   const arrival = Number.isFinite(tick) ? ` · arrival tick ${tick}` : "";
   return `${kind === "pathfinder" ? "Drifting" : kind === "travel" ? "Traveling" : "Jumping"} to ${destination}${arrival}`;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))
+      ? Number(value)
+      : undefined;
+}
+
+function textOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function parseRoutePlan(value: unknown, fallbackDestination: string): RoutePlan | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const payload = value as Record<string, unknown>;
+  if (payload.found === false) return null;
+  const rawSteps = Array.isArray(payload.route) ? payload.route : payload.steps;
+  if (!Array.isArray(rawSteps)) return null;
+
+  const steps: RouteStep[] = [];
+  for (const raw of rawSteps) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const step = raw as Record<string, unknown>;
+    const systemId = textOrUndefined(step.systemId) ?? textOrUndefined(step.system_id);
+    const jumps = numberOrUndefined(step.jumps);
+    if (!systemId || jumps === undefined || jumps <= 0) continue;
+    const kind = textOrUndefined(step.kind) ?? textOrUndefined(step.type);
+    steps.push({
+      systemId,
+      name: textOrUndefined(step.name),
+      jumps,
+      kind: kind === "travel" || kind === "jump" ? kind : undefined,
+    });
+  }
+  if (steps.length === 0) return null;
+  steps.sort((left, right) => left.jumps - right.jumps);
+
+  const totalJumps = numberOrUndefined(payload.totalJumps) ?? numberOrUndefined(payload.total_jumps) ?? steps.length;
+  const targetPoi = textOrUndefined(payload.targetPoi) ?? textOrUndefined(payload.target_poi);
+  if (targetPoi) {
+    steps.push({
+      systemId: targetPoi,
+      name: textOrUndefined(payload.targetPoiName) ?? textOrUndefined(payload.target_poi_name) ?? targetPoi,
+      jumps: totalJumps,
+      kind: "travel",
+    });
+  }
+
+  return {
+    destination: textOrUndefined(payload.destination)
+      ?? textOrUndefined(payload.target_poi)
+      ?? textOrUndefined(payload.targetPoi)
+      ?? textOrUndefined(payload.target_system)
+      ?? textOrUndefined(payload.targetSystem)
+      ?? fallbackDestination,
+    steps,
+    totalJumps,
+    targetSystem: textOrUndefined(payload.targetSystem) ?? textOrUndefined(payload.target_system),
+    targetPoi,
+    targetPoiName: textOrUndefined(payload.targetPoiName) ?? textOrUndefined(payload.target_poi_name),
+    message: textOrUndefined(payload.message),
+    estimatedFuel: numberOrUndefined(payload.estimatedFuel) ?? numberOrUndefined(payload.estimated_fuel),
+    fuelAvailable: numberOrUndefined(payload.fuelAvailable) ?? numberOrUndefined(payload.fuel_available),
+  };
+}
+
+function routeStepLabel(step: RouteStep): string {
+  return step.name ?? step.systemId;
+}
+
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    let timer: number | undefined;
+    const onAbort = () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function parseModelChoices(value: unknown): ModelChoice[] {
@@ -297,6 +422,10 @@ export default function App() {
   const [location, setLocation] = useState<TransitLocation | null>(null);
   const [tracking, setTracking] = useState(false);
   const [retryRequest, setRetryRequest] = useState<RetryRequest | null>(null);
+  const [routeInput, setRouteInput] = useState("");
+  const [routePlan, setRoutePlan] = useState<RoutePlan | null>(null);
+  const [routeRun, setRouteRun] = useState<RouteRun | null>(null);
+  const [routeBusy, setRouteBusy] = useState(false);
   const [providerChoices, setProviderChoices] = useState<ProviderChoice[]>([]);
   const [selectedProvider, setSelectedProvider] = useState("");
   const [defaultProvider, setDefaultProvider] = useState("");
@@ -438,6 +567,7 @@ export default function App() {
     setTask(null);
     setChatBusy(false);
     setApprovalBusy(false);
+    setRouteRun((current) => current?.status === "running" ? { ...current, status: "stopped" } : current);
     setChatHistory((current) => trimChatHistory([...current, {
       role: "assistant",
       content: "Interrupted locally — stopped waiting here. Anything already sent to SpaceMolt may still complete.",
@@ -520,17 +650,27 @@ export default function App() {
       const chat = data as unknown as ChatResult;
       const actions = Array.isArray(chat.actions) ? chat.actions : [];
       const pending = parsePendingActions(chat.pending_actions);
+      const foundRoutes = Array.isArray(chat.routes)
+        ? chat.routes.flatMap((route) => {
+          const parsed = parseRoutePlan(route, "");
+          return parsed ? [parsed] : [];
+        })
+        : [];
+      if (foundRoutes.length > 0) setRoutePlan(foundRoutes[0]);
       const details = actions.length
         ? `\n\nActions:\n${actions.map(actionLabel).join("\n")}`
         : "";
       const approvalNote = pending.length
         ? `\n\n${pending.length} action(s) are waiting for your approval below.`
         : "";
+      const routeNote = foundRoutes.length > 0
+        ? `\n\nRoute ready: ${foundRoutes[0].totalJumps} jump(s). Press Follow route below to travel.`
+        : "";
       const reply = safeText(chat.reply);
       setPendingActions(pending);
       setChatHistory(trimChatHistory([...next, {
         role: "assistant",
-        content: `${reply === "—" ? "No reply." : reply}${details}${approvalNote}`,
+        content: `${reply === "—" ? "No reply." : reply}${details}${approvalNote}${routeNote}`,
       }]));
       if (chat.error) setChatError(safeText(chat.error));
       setRetryRequest(null);
@@ -645,14 +785,156 @@ export default function App() {
     }
   }, [sessionId, beginTask]);
 
+  const planRoute = useCallback(async (rawDestination?: string) => {
+    const destination = (rawDestination ?? routeInput).trim();
+    if (!destination) {
+      setChatError("Enter a destination system, POI, or base id.");
+      return;
+    }
+    if (!sessionId) {
+      setChatError("Connect a pilot first.");
+      return;
+    }
+    setRouteBusy(true);
+    setChatError("");
+    try {
+      const data = await readJson(`${BACKEND_URL}/api/action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, tool: "spacemolt", action: "find_route", args: { id: destination } }),
+      });
+      const record = data.action as GameActionRecord | undefined;
+      const plan = parseRoutePlan(record?.structured, destination);
+      if (!plan) {
+        throw new Error(record?.result || record?.error || safeText(data.error) || "No route found.");
+      }
+      setRoutePlan(plan);
+      setChatHistory((current) => trimChatHistory([...current, {
+        role: "assistant",
+        content: `Route to ${plan.destination}: ${plan.totalJumps} jump(s). ${plan.steps.map(routeStepLabel).join(" → ")}. Press Follow route to travel.`,
+      }]));
+    } catch (err) {
+      if (isAbortError(err)) return;
+      setChatError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRouteBusy(false);
+    }
+  }, [sessionId, routeInput]);
+
+  const startRoute = useCallback(async (plan: RoutePlan) => {
+    if (!sessionId || plan.steps.length === 0) return;
+    const controller = beginTask(`Route to ${plan.destination}`);
+    setChatBusy(true);
+    setChatError("");
+    setRetryRequest({ kind: "route", plan });
+    setRouteRun({ plan, index: 0, status: "running" });
+    setTracking(true);
+
+    let currentIndex = 0;
+    const append = (content: string) => {
+      setChatHistory((current) => trimChatHistory([...current, { role: "assistant", content }]));
+    };
+
+    const locationRequest = (signal: AbortSignal) => readJson(`${BACKEND_URL}/api/location`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+      signal,
+    });
+
+    const readTransitLocation = async (signal: AbortSignal): Promise<TransitLocation | null> => {
+      const data = await locationRequest(signal);
+      const raw = data.location;
+      const parsed = raw && typeof raw === "object" ? raw as TransitLocation : null;
+      if (parsed) setLocation(parsed);
+      return parsed;
+    };
+
+    const waitForArrival = async (signal: AbortSignal): Promise<boolean> => {
+      for (let attempt = 0; attempt < 120; attempt++) {
+        await delay(2500, signal);
+        const parsed = await readTransitLocation(signal);
+        if (parsed?.in_transit !== true) return true;
+      }
+      return false;
+    };
+
+    try {
+      for (const step of plan.steps) {
+        if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+        setRouteRun({ plan, index: currentIndex, status: "running" });
+
+        let before = await readTransitLocation(controller.signal);
+        if (before?.in_transit === true) {
+          append(`Waiting for the current jump to finish before continuing the route.`);
+          if (!(await waitForArrival(controller.signal))) {
+            throw new Error(`Timed out waiting for the current jump to finish.`);
+          }
+          before = await readTransitLocation(controller.signal);
+        }
+        const isTravel = step.kind === "travel";
+        const currentPlace = isTravel
+          ? before?.poi_id ?? before?.poi_name ?? before?.poi
+          : before?.system_name ?? before?.system_id ?? before?.system;
+        if (currentPlace === step.systemId || currentPlace === step.name) {
+          currentIndex += 1;
+          setRouteRun({ plan, index: currentIndex, status: "running" });
+          continue;
+        }
+
+        const actionName = isTravel ? "travel" : "jump";
+        append(`Route step ${currentIndex + 1}/${plan.steps.length}: ${isTravel ? "travelling to" : "jumping to"} ${routeStepLabel(step)} (${step.systemId}).`);
+        const stepData = await readJson(`${BACKEND_URL}/api/action`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId, tool: "spacemolt", action: actionName, args: { id: step.systemId } }),
+          signal: controller.signal,
+        });
+        const record = stepData.action as GameActionRecord | undefined;
+        if (!record?.ok) {
+          throw new Error(record?.error || safeText(stepData.error) || `${isTravel ? "Travel to" : "Jump to"} ${step.systemId} failed.`);
+        }
+        if (!(await waitForArrival(controller.signal))) {
+          throw new Error(`Timed out waiting for arrival at ${routeStepLabel(step)}.`);
+        }
+        currentIndex += 1;
+        setRouteRun({ plan, index: currentIndex, status: "running" });
+      }
+
+      if (abortRef.current === controller) {
+        setRouteRun({ plan, index: currentIndex, status: "done" });
+        append(`Route complete: reached ${plan.destination}.`);
+        setRetryRequest(null);
+        setTask(null);
+        setTracking(false);
+        setChatBusy(false);
+        abortRef.current = null;
+      }
+    } catch (err) {
+      if (isAbortError(err)) return;
+      const messageText = err instanceof Error ? err.message : String(err);
+      setChatError(messageText);
+      if (abortRef.current === controller) {
+        setRouteRun({ plan, index: currentIndex, status: "error", error: messageText });
+        append(`Route stopped at step ${currentIndex + 1}: ${messageText}`);
+        setRetryRequest({ kind: "route", plan: { ...plan, steps: plan.steps.slice(currentIndex) } });
+        setTask(null);
+        setTracking(false);
+        setChatBusy(false);
+        abortRef.current = null;
+      }
+    }
+  }, [sessionId, beginTask]);
+
   const retry = useCallback(() => {
     const request = retryRequest;
     if (!request || !sessionId) return;
     setRetryRequest(null);
     if (request.kind === "chat") void submitChat(request.message);
     else if (request.kind === "execute") void approveActions(request.actions);
+    else if (request.kind === "route") void startRoute(request.plan);
     else void runAction(request.tool, request.action, request.args);
-  }, [retryRequest, sessionId, submitChat, approveActions, runAction]);
+  }, [retryRequest, sessionId, submitChat, approveActions, startRoute, runAction]);
 
   return (
     <>
@@ -901,7 +1183,9 @@ export default function App() {
                     <strong>{transitLabel(location) || (task ? `${task.label}…` : "In transit…")}</strong>
                     <span className="meta">
                       {task ? `Working for ${elapsed}s` : "Waiting for arrival"}
-                      {location?.system ? ` · ${safeText(location.system)}` : ""}
+                      {location?.system_name ?? location?.system_id ?? location?.system
+                        ? ` · ${safeText(location?.system_name ?? location?.system_id ?? location?.system)}`
+                        : ""}
                     </span>
                   </div>
                   {task && (
@@ -911,6 +1195,48 @@ export default function App() {
                   )}
                 </div>
               )}
+
+              <div className="route-panel">
+                <label className="ask-label" htmlFor="route-destination">Multi-jump route</label>
+                <div className="route-form">
+                  <input
+                    id="route-destination"
+                    value={routeInput}
+                    onChange={(event) => setRouteInput(event.target.value)}
+                    placeholder="Destination system, POI, or base id — e.g. tau_ceti"
+                    disabled={chatBusy || routeBusy}
+                  />
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={chatBusy || routeBusy || !routeInput.trim()}
+                    onClick={() => void planRoute()}
+                  >
+                    {routeBusy ? "Finding…" : "Find route"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={chatBusy || routeBusy || !routePlan || routePlan.steps.length === 0}
+                    onClick={() => { if (routePlan) void startRoute(routePlan); }}
+                  >
+                    Follow route
+                  </button>
+                </div>
+                {routePlan && (
+                  <p className="meta">
+                    {routePlan.totalJumps} jump(s) to {safeText(routePlan.destination)}
+                    {routePlan.steps.length > 0 ? ` · ${routePlan.steps.map(routeStepLabel).join(" → ")}` : ""}
+                    {routePlan.estimatedFuel !== undefined ? ` · est. fuel ${routePlan.estimatedFuel}` : ""}
+                    {routePlan.fuelAvailable !== undefined ? ` · fuel available ${routePlan.fuelAvailable}` : ""}
+                  </p>
+                )}
+                {routeRun && (
+                  <p className="meta">
+                    Route status: {routeRun.status} · step {routeRun.index}/{routeRun.plan.steps.length}
+                    {routeRun.error ? ` · ${routeRun.error}` : ""}
+                  </p>
+                )}
+              </div>
 
               {pendingActions.length > 0 && (
                 <div className="pending">
@@ -1055,6 +1381,11 @@ const styles = `
   .objective .meta { margin: 0; font-size: 0.8rem; }
   .chat-form { display: grid; gap: 0.5rem; min-width: 0; }
   .ask-label { color: #cbd5e1; font-size: 0.9rem; letter-spacing: 0.02em; }
+  .route-panel { display: grid; gap: 0.5rem; margin-bottom: 0.75rem; min-width: 0; }
+  .route-form { display: flex; flex-wrap: wrap; gap: 0.5rem; min-width: 0; }
+  .route-form input { flex: 1 1 18rem; min-width: 0; }
+  .route-form button { margin: 0; }
+  .route-panel .meta { margin: 0; font-size: 0.85rem; }
   .chat-form textarea { width: 100%; min-width: 0; resize: vertical; }
   .chat-actions { display: flex; justify-content: flex-end; }
   .chat-actions button { margin: 0; }
