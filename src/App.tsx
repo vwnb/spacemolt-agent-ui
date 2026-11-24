@@ -5,6 +5,14 @@ import {
   UserButton,
   useAuth,
 } from "@clerk/react";
+import {
+  HttpError,
+  isDefiniteRequestFailure,
+  locationMatchesStep,
+  locationPlaceLabel,
+  type RouteStep,
+  type TransitLocation,
+} from "./route.js";
 
 const BACKEND_URL = (
   import.meta.env.VITE_BACKEND_URL ||
@@ -50,8 +58,6 @@ type RetryRequest =
   | { kind: "action"; tool: string; action: string; args: Record<string, unknown> }
   | { kind: "route"; plan: RoutePlan };
 
-type RouteStep = { systemId: string; name?: string; jumps: number; kind?: "jump" | "travel" };
-
 type RoutePlan = {
   destination: string;
   steps: RouteStep[];
@@ -69,22 +75,6 @@ type RouteRun = {
   index: number;
   status: "running" | "stopped" | "done" | "error";
   error?: string;
-};
-
-type TransitLocation = {
-  system?: unknown;
-  system_id?: unknown;
-  system_name?: unknown;
-  poi?: unknown;
-  poi_id?: unknown;
-  poi_name?: unknown;
-  in_transit?: unknown;
-  transit_type?: unknown;
-  transit_dest_system_id?: unknown;
-  transit_dest_system_name?: unknown;
-  transit_dest_poi_id?: unknown;
-  transit_dest_poi_name?: unknown;
-  transit_arrival_tick?: unknown;
 };
 
 const MAX_CHAT_HISTORY = 20;
@@ -391,7 +381,7 @@ async function readJson(url: string, init?: RequestInit): Promise<Record<string,
   const res = await fetch(url, init);
   const data = await res.json().catch(() => null) as Record<string, unknown> | null;
   if (!res.ok) {
-    throw new Error(typeof data?.error === "string" ? data.error : `Request failed (${res.status}).`);
+    throw new HttpError(res.status, typeof data?.error === "string" ? data.error : `Request failed (${res.status}).`);
   }
   return data ?? {};
 }
@@ -859,9 +849,31 @@ export default function App() {
       return false;
     };
 
+    const waitForStep = async (step: RouteStep, signal: AbortSignal): Promise<{ ok: true } | { ok: false; error: string }> => {
+      const startedAt = Date.now();
+      let sawTransit = false;
+      while (Date.now() - startedAt < 600_000) {
+        await delay(2000, signal);
+        const parsed = await readTransitLocation(signal);
+        if (locationMatchesStep(parsed, step)) return { ok: true };
+        if (parsed?.in_transit === true) {
+          sawTransit = true;
+          continue;
+        }
+        if (sawTransit) {
+          return { ok: false, error: `Arrived at ${locationPlaceLabel(parsed)}, not ${routeStepLabel(step)}.` };
+        }
+        if (Date.now() - startedAt >= 20_000) {
+          return { ok: false, error: `No transit started toward ${routeStepLabel(step)}; current location is ${locationPlaceLabel(parsed)}.` };
+        }
+      }
+      return { ok: false, error: `Timed out waiting for arrival at ${routeStepLabel(step)}.` };
+    };
+
     try {
-      for (const step of plan.steps) {
+      while (currentIndex < plan.steps.length) {
         if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const step = plan.steps[currentIndex];
         setRouteRun({ plan, index: currentIndex, status: "running" });
 
         let before = await readTransitLocation(controller.signal);
@@ -872,30 +884,47 @@ export default function App() {
           }
           before = await readTransitLocation(controller.signal);
         }
-        const isTravel = step.kind === "travel";
-        const currentPlace = isTravel
-          ? before?.poi_id ?? before?.poi_name ?? before?.poi
-          : before?.system_name ?? before?.system_id ?? before?.system;
-        if (currentPlace === step.systemId || currentPlace === step.name) {
+        if (locationMatchesStep(before, step)) {
           currentIndex += 1;
           setRouteRun({ plan, index: currentIndex, status: "running" });
           continue;
         }
 
+        const isTravel = step.kind === "travel";
         const actionName = isTravel ? "travel" : "jump";
         append(`Route step ${currentIndex + 1}/${plan.steps.length}: ${isTravel ? "travelling to" : "jumping to"} ${routeStepLabel(step)} (${step.systemId}).`);
-        const stepData = await readJson(`${BACKEND_URL}/api/action`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId, tool: "spacemolt", action: actionName, args: { id: step.systemId } }),
-          signal: controller.signal,
-        });
-        const record = stepData.action as GameActionRecord | undefined;
-        if (!record?.ok) {
-          throw new Error(record?.error || safeText(stepData.error) || `${isTravel ? "Travel to" : "Jump to"} ${step.systemId} failed.`);
+
+        let submitted = true;
+        let requestError: string | undefined;
+        try {
+          const stepData = await readJson(`${BACKEND_URL}/api/action`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId, tool: "spacemolt", action: actionName, args: { id: step.systemId } }),
+            signal: controller.signal,
+          });
+          const record = stepData.action as GameActionRecord | undefined;
+          if (record?.ok === false && stepData.pending !== true) {
+            submitted = false;
+            requestError = record.error || safeText(stepData.error) || `${isTravel ? "Travel to" : "Jump to"} ${step.systemId} failed.`;
+          }
+        } catch (err) {
+          if (isAbortError(err)) throw err;
+          requestError = err instanceof Error ? err.message : String(err);
+          const status = err instanceof HttpError ? err.status : undefined;
+          if (isDefiniteRequestFailure(status)) {
+            submitted = false;
+          } else {
+            append(`Movement request did not return in time; checking SpaceMolt for the result.`);
+          }
         }
-        if (!(await waitForArrival(controller.signal))) {
-          throw new Error(`Timed out waiting for arrival at ${routeStepLabel(step)}.`);
+        if (!submitted) {
+          throw new Error(requestError ?? `${isTravel ? "Travel to" : "Jump to"} ${step.systemId} failed.`);
+        }
+
+        const outcome = await waitForStep(step, controller.signal);
+        if (!outcome.ok) {
+          throw new Error(`${outcome.error}${requestError ? ` (request: ${requestError})` : ""}`);
         }
         currentIndex += 1;
         setRouteRun({ plan, index: currentIndex, status: "running" });
@@ -917,7 +946,7 @@ export default function App() {
       if (abortRef.current === controller) {
         setRouteRun({ plan, index: currentIndex, status: "error", error: messageText });
         append(`Route stopped at step ${currentIndex + 1}: ${messageText}`);
-        setRetryRequest({ kind: "route", plan: { ...plan, steps: plan.steps.slice(currentIndex) } });
+        setRetryRequest({ kind: "route", plan });
         setTask(null);
         setTracking(false);
         setChatBusy(false);
