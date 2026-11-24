@@ -51,6 +51,8 @@ Type free-form requests too, e.g. `check my system for ore and tell me the best 
 
 Approval cards show the exact `tool/action/args` and reason before anything sensitive happens. Text actions also show an editable text box; the pilot can revise the draft and click **Approve & send**, which sends that exact edited text to `POST /api/execute`. Decline discards the proposal locally. Combat, hunting, faction and mission writes, passengers, crafting, freight, gifts, trades, chat, forum posts and petitions all require approval.
 
+While a request runs, a progress panel shows elapsed time and polls `POST /api/location` for SpaceMolt's live transit state, so a jump or travel reports its destination and arrival tick instead of leaving the UI apparently frozen. **Interrupt** aborts the local request and stops watching; it cannot cancel an action SpaceMolt has already accepted. **Retry last request** re-sends the interrupted or failed chat turn, approval batch, or single safe action; safe-action retries go through `POST /api/action`.
+
 ## Errors
 
 - `400` → invalid input or SpaceMolt error; the backend message is shown.

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   SignInButton,
   Show,
@@ -41,6 +41,23 @@ type ConnectResult = {
 };
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
+
+type WorkingTask = { label: string; startedAt: number };
+
+type RetryRequest =
+  | { kind: "chat"; message: string }
+  | { kind: "execute"; actions: PendingAction[] }
+  | { kind: "action"; tool: string; action: string; args: Record<string, unknown> };
+
+type TransitLocation = {
+  system?: unknown;
+  poi?: unknown;
+  in_transit?: unknown;
+  transit_type?: unknown;
+  transit_dest_system_name?: unknown;
+  transit_dest_poi_name?: unknown;
+  transit_arrival_tick?: unknown;
+};
 
 const MAX_CHAT_HISTORY = 20;
 
@@ -117,6 +134,20 @@ function safeText(value: unknown): string {
 function safeList(value: unknown): string {
   if (Array.isArray(value)) return value.length ? value.map(safeText).join(", ") : "none";
   return safeText(value);
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+function transitLabel(location: TransitLocation | null): string {
+  if (!location || location.in_transit !== true) return "";
+  const kind = safeText(location.transit_type);
+  const destination = safeText(location.transit_dest_system_name ?? location.transit_dest_poi_name ?? "destination");
+  const rawTick = location.transit_arrival_tick;
+  const tick = typeof rawTick === "number" ? rawTick : typeof rawTick === "string" ? Number(rawTick) : NaN;
+  const arrival = Number.isFinite(tick) ? ` · arrival tick ${tick}` : "";
+  return `${kind === "pathfinder" ? "Drifting" : kind === "travel" ? "Traveling" : "Jumping"} to ${destination}${arrival}`;
 }
 
 function parseModelChoices(value: unknown): ModelChoice[] {
@@ -260,6 +291,12 @@ export default function App() {
   const [chatError, setChatError] = useState("");
   const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
   const [approvalBusy, setApprovalBusy] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const [task, setTask] = useState<WorkingTask | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [location, setLocation] = useState<TransitLocation | null>(null);
+  const [tracking, setTracking] = useState(false);
+  const [retryRequest, setRetryRequest] = useState<RetryRequest | null>(null);
   const [providerChoices, setProviderChoices] = useState<ProviderChoice[]>([]);
   const [selectedProvider, setSelectedProvider] = useState("");
   const [defaultProvider, setDefaultProvider] = useState("");
@@ -385,6 +422,71 @@ export default function App() {
     }
   }, [username, empire, registrationCode]);
 
+  const beginTask = useCallback((label: string) => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setTask({ label, startedAt: Date.now() });
+    setElapsed(0);
+    setTracking(true);
+    return controller;
+  }, []);
+
+  const interrupt = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setTask(null);
+    setChatBusy(false);
+    setApprovalBusy(false);
+    setChatHistory((current) => trimChatHistory([...current, {
+      role: "assistant",
+      content: "Interrupted locally — stopped waiting here. Anything already sent to SpaceMolt may still complete.",
+    }]));
+  }, []);
+
+  useEffect(() => {
+    if (!task) return;
+    const timer = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - task.startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [task]);
+
+  useEffect(() => {
+    if (!sessionId || !tracking) return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      try {
+        const data = await readJson(`${BACKEND_URL}/api/location`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId }),
+        });
+        if (cancelled) return;
+        const raw = data.location;
+        const parsed = raw && typeof raw === "object" ? raw as TransitLocation : null;
+        setLocation(parsed);
+        if (parsed?.in_transit !== true && !abortRef.current) setTracking(false);
+      } catch {
+        if (!cancelled && !abortRef.current) setTracking(false);
+      }
+      if (!cancelled && timer === undefined) {
+        timer = window.setTimeout(() => {
+          timer = undefined;
+          void poll();
+        }, 2500);
+      }
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [sessionId, tracking]);
+
   const submitChat = useCallback(async (message: string) => {
     const clean = message.trim();
     if (!clean) return;
@@ -398,6 +500,8 @@ export default function App() {
     setChatInput("");
     setChatBusy(true);
     setChatError("");
+    setRetryRequest({ kind: "chat", message: clean });
+    const controller = beginTask("Agent turn");
 
     try {
       const data = await readJson(`${BACKEND_URL}/api/chat`, {
@@ -411,6 +515,7 @@ export default function App() {
           history: next.slice(0, -1),
           model: selectedModel || undefined,
         }),
+        signal: controller.signal,
       });
       const chat = data as unknown as ChatResult;
       const actions = Array.isArray(chat.actions) ? chat.actions : [];
@@ -428,14 +533,20 @@ export default function App() {
         content: `${reply === "—" ? "No reply." : reply}${details}${approvalNote}`,
       }]));
       if (chat.error) setChatError(safeText(chat.error));
+      setRetryRequest(null);
     } catch (err) {
+      if (isAbortError(err)) return;
       const messageText = err instanceof Error ? err.message : String(err);
       setChatHistory(trimChatHistory([...next, { role: "assistant", content: `Error: ${messageText}` }]));
       setChatError(messageText);
     } finally {
-      setChatBusy(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setTask(null);
+        setChatBusy(false);
+      }
     }
-  }, [sessionId, chatHistory, objective, selectedProvider, defaultProvider, selectedModel]);
+  }, [sessionId, chatHistory, objective, selectedProvider, defaultProvider, selectedModel, beginTask]);
 
   const approveActions = useCallback(async (actions: PendingAction[]) => {
     if (!sessionId || actions.length === 0) return;
@@ -449,12 +560,15 @@ export default function App() {
     }));
     setApprovalBusy(true);
     setChatError("");
+    setRetryRequest({ kind: "execute", actions });
+    const controller = beginTask(`${actions.length} approved action(s)`);
 
     try {
       const data = await readJson(`${BACKEND_URL}/api/execute`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId, actions: preparedActions }),
+        signal: controller.signal,
       });
       const results = Array.isArray(data.actions) ? data.actions as GameActionRecord[] : [];
       setPendingActions((current) => current.filter((action) => !action.id || !ids.has(action.id)));
@@ -464,17 +578,23 @@ export default function App() {
         content: `Approved ${actions.length} action(s).\n\nActions:\n${results.map(actionLabel).join("\n")}`,
       }]);
       if (data.error) setChatError(safeText(data.error));
+      setRetryRequest(null);
     } catch (err) {
+      if (isAbortError(err)) return;
       const messageText = err instanceof Error ? err.message : String(err);
       setChatError(messageText);
-      setChatHistory((current) => [...current, {
+      setChatHistory(trimChatHistory([...chatHistory, {
         role: "assistant",
         content: `Approval failed: ${messageText}`,
-      }]);
+      }]));
     } finally {
-      setApprovalBusy(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setTask(null);
+        setApprovalBusy(false);
+      }
     }
-  }, [sessionId, draftEdits]);
+  }, [sessionId, chatHistory, draftEdits, beginTask]);
 
   const declineActions = useCallback((actions: PendingAction[]) => {
     const ids = new Set(actions.map((action) => action.id).filter((id): id is string => Boolean(id)));
@@ -485,6 +605,54 @@ export default function App() {
       content: `Declined ${actions.length} action(s). Nothing was sent to SpaceMolt.`,
     }]);
   }, []);
+
+  const runAction = useCallback(async (tool: string, action: string, args: Record<string, unknown>) => {
+    if (!sessionId) return;
+    setChatBusy(true);
+    setChatError("");
+    setRetryRequest({ kind: "action", tool, action, args });
+    const controller = beginTask(`${tool}/${action}`);
+    const label = `${tool}/${action}`;
+
+    try {
+      const data = await readJson(`${BACKEND_URL}/api/action`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, tool, action, args }),
+        signal: controller.signal,
+      });
+      const result = data.action as GameActionRecord | undefined;
+      setChatHistory((current) => trimChatHistory([...current, {
+        role: "assistant",
+        content: `${label}: ${result && typeof result.result === "string" && result.result ? result.result : safeText(result?.error ?? "done")}`,
+      }]));
+      if (data.error) setChatError(safeText(data.error));
+      setRetryRequest(null);
+    } catch (err) {
+      if (isAbortError(err)) return;
+      const messageText = err instanceof Error ? err.message : String(err);
+      setChatError(messageText);
+      setChatHistory((current) => trimChatHistory([...current, {
+        role: "assistant",
+        content: `Retry of ${label} failed: ${messageText}`,
+      }]));
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setTask(null);
+        setChatBusy(false);
+      }
+    }
+  }, [sessionId, beginTask]);
+
+  const retry = useCallback(() => {
+    const request = retryRequest;
+    if (!request || !sessionId) return;
+    setRetryRequest(null);
+    if (request.kind === "chat") void submitChat(request.message);
+    else if (request.kind === "execute") void approveActions(request.actions);
+    else void runAction(request.tool, request.action, request.args);
+  }, [retryRequest, sessionId, submitChat, approveActions, runAction]);
 
   return (
     <>
@@ -727,6 +895,23 @@ export default function App() {
                 </div>
               )}
 
+              {(task || tracking) && (
+                <div className="progress">
+                  <div className="progress-text">
+                    <strong>{transitLabel(location) || (task ? `${task.label}…` : "In transit…")}</strong>
+                    <span className="meta">
+                      {task ? `Working for ${elapsed}s` : "Waiting for arrival"}
+                      {location?.system ? ` · ${safeText(location.system)}` : ""}
+                    </span>
+                  </div>
+                  {task && (
+                    <button type="button" className="secondary" onClick={interrupt}>
+                      Interrupt
+                    </button>
+                  )}
+                </div>
+              )}
+
               {pendingActions.length > 0 && (
                 <div className="pending">
                   <div className="pending-head">
@@ -806,6 +991,20 @@ export default function App() {
                 </div>
               </form>
               {chatError && <p className="error">{chatError}</p>}
+              {retryRequest && !task && (
+                <div className="retry-row">
+                  <button type="button" className="secondary" onClick={retry}>
+                    Retry last request
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => setRetryRequest(null)}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
             </section>
           )}
         </Show>
@@ -869,6 +1068,13 @@ const styles = `
   .draft-label textarea { width: 100%; min-width: 0; resize: vertical; }
   .pending-buttons { display: flex; gap: 0.5rem; }
   .pending-buttons button { margin: 0; }
+  .progress { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.75rem; margin-bottom: 0.75rem; border: 1px solid #2563eb; border-radius: 2px; background: #171b22; min-width: 0; }
+  .progress-text { display: grid; gap: 0.25rem; min-width: 0; }
+  .progress-text strong { color: #93c5fd; overflow-wrap: anywhere; }
+  .progress-text .meta { font-size: 0.85rem; }
+  .progress button { margin: 0; flex-shrink: 0; }
+  .retry-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+  .retry-row button { margin: 0; }
   dl { display: grid; grid-template-columns: 9rem minmax(0, 1fr); gap: 0.4rem 1rem; margin: 0; }
   dt { color: #9aa3b2; }
   dd { margin: 0; overflow-wrap: anywhere; }
