@@ -35,11 +35,11 @@ Clerk signs the human into this app only. SpaceMolt has its own login, so no Spa
 3. The UI polls the backend until approval, then shows the observation and enables **Pilot chat**. No password, username, or SpaceMolt token is handled by this app.
 4. To create a new pilot, choose **Create pilot with registration code**, enter a username, empire, and the code from `https://spacemolt.com/dashboard`. The generated password is shown once - save it.
 
-All transient links, codes, generated passwords and the SpaceMolt `sessionId` live only in component state. Nothing is written to `localStorage` or other persistent storage. A Clerk JWT is never sent to SpaceMolt.
+All transient links, codes, generated passwords and the SpaceMolt `sessionId` live only in component state. Only the chosen LLM provider/model are saved in `localStorage`, so they survive reloads; saved values that are no longer offered fall back to the server default. A Clerk JWT is never sent to SpaceMolt.
 
 ## Pilot chat
 
-After connecting, the chat section sends messages to `POST /api/chat` with the in-memory `sessionId`, the last 20 messages, the selected provider/model from `GET /api/health`'s `llmProviders` and `llmModelOptionsByProvider`, and the editable personal objective. The backend prefetches game state, asks the LLM for a reply plus at most four registered actions, executes safe actions immediately, and returns action results plus any proposals. The agent prioritizes active missions and the personal objective, and reports what changed after each meaningful batch.
+After connecting, the chat section sends messages to `POST /api/chat` with the in-memory `sessionId`, the last 20 messages, the selected provider/model from `GET /api/health`'s `llmProviders` and `llmModelOptionsByProvider`, and the editable personal objective. Provider/model choices are remembered in `localStorage` and restored after reload. The backend prefetches game state, asks the LLM for a reply plus at most four registered actions, executes safe actions immediately, and returns action results plus any proposals. The agent prioritizes active missions and the personal objective, and reports what changed after each meaningful batch.
 
 Quick prompts cover the basic loop:
 

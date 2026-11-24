@@ -13,6 +13,7 @@ import {
   type RouteStep,
   type TransitLocation,
 } from "./route.js";
+import { loadLlmSelection, resolveLlmSelection, saveLlmModel, saveLlmProvider } from "./preferences.js";
 
 const BACKEND_URL = (
   import.meta.env.VITE_BACKEND_URL ||
@@ -431,13 +432,22 @@ export default function App() {
         if (cancelled) return;
         const providers = parseProviderChoices(data.llmProviders);
         const byProvider = parseModelOptionsByProvider(data.llmModelOptionsByProvider);
+        const fallbackModels = parseModelChoices(data.llmModelOptions);
         const serverProvider = typeof data.llmProvider === "string" ? data.llmProvider : "";
+        if (serverProvider && !byProvider[serverProvider]) byProvider[serverProvider] = fallbackModels;
+        const selected = resolveLlmSelection(
+          loadLlmSelection(),
+          providers.map((provider) => provider.key),
+          Object.fromEntries(Object.entries(byProvider).map(([key, choices]) => [key, choices.map((choice) => choice.id)])),
+          serverProvider,
+        );
         setProviderChoices(providers);
         setModelChoicesByProvider(byProvider);
         setDefaultProvider(serverProvider);
-        setSelectedProvider(serverProvider);
-        setModelChoices(byProvider[serverProvider] ?? parseModelChoices(data.llmModelOptions));
-        if (typeof data.llmModel === "string") setDefaultModel(data.llmModel);
+        setDefaultModel(typeof data.llmModel === "string" ? data.llmModel : "");
+        setSelectedProvider(selected.provider);
+        setModelChoices(byProvider[selected.provider || serverProvider] ?? []);
+        setSelectedModel(selected.model);
       })
       .catch(() => {});
     return () => {
@@ -1064,8 +1074,14 @@ export default function App() {
               <p className="code">{link.userCode}</p>
               <p>{link.instructions}</p>
               <p>
-                <a href={link.verificationUriComplete} target="_blank" rel="noreferrer">
-                  {link.verificationUriComplete}
+                <a
+                  className="link-url"
+                  href={link.verificationUriComplete}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={link.verificationUriComplete}
+                >
+                  Open SpaceMolt approval link
                 </a>
               </p>
               {pollStatus && <p className="meta">{pollStatus}</p>}
@@ -1134,7 +1150,9 @@ export default function App() {
                     const key = event.target.value;
                     setSelectedProvider(key);
                     setSelectedModel("");
-                    setModelChoices(modelChoicesByProvider[key] ?? []);
+                    setModelChoices(modelChoicesByProvider[key || defaultProvider] ?? []);
+                    saveLlmProvider(key);
+                    saveLlmModel("");
                   }}
                   disabled={chatBusy}
                 >
@@ -1154,7 +1172,10 @@ export default function App() {
                 <select
                   id="model-select"
                   value={selectedModel}
-                  onChange={(event) => setSelectedModel(event.target.value)}
+                  onChange={(event) => {
+                    setSelectedModel(event.target.value);
+                    saveLlmModel(event.target.value);
+                  }}
                   disabled={chatBusy}
                 >
                   <option value="">
@@ -1377,11 +1398,11 @@ const styles = `
   }
   * { box-sizing: border-box; }
   body { margin: 0; }
-  main { max-width: 46rem; margin: 3rem auto; padding: 0 1rem; min-width: 0; }
-  header, .row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  main { max-width: 46rem; margin: 3rem auto; padding: 0 1rem; min-width: 0; overflow-wrap: anywhere; }
+  header, .row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-width: 0; }
   h1 { font-size: 1.6rem; font-weight: 600; letter-spacing: 0.015em; }
   h2 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.015em; }
-  section { margin-top: 1.5rem; padding: 1rem; border: 1px solid #2a2f38; border-radius: 3px; min-width: 0; }
+  section { margin-top: 1.5rem; padding: 1rem; border: 1px solid #2a2f38; border-radius: 3px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
   button, input, select, textarea { font: inherit; padding: 0.5rem 0.75rem; border-radius: 2px; border: 1px solid #3a4150; background: #1d222b; color: inherit; }
   button { cursor: pointer; background: #2563eb; border-color: #2563eb; }
   button.secondary { background: #1d222b; border-color: #3a4150; }
@@ -1389,20 +1410,21 @@ const styles = `
   section > button { margin-left: 0.5rem; }
   .form { display: grid; gap: 0.75rem; }
   .form label { display: grid; gap: 0.35rem; color: #9aa3b2; }
-  a { color: #93c5fd; overflow-wrap: anywhere; }
+  a { color: #93c5fd; overflow-wrap: anywhere; word-break: break-word; }
+  .link-url { display: inline-block; max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
   .code { font-size: 1.4rem; font-weight: 700; letter-spacing: 0.1em; }
   .error { color: #fca5a5; }
   .notice { color: #fcd34d; }
   .meta { color: #9aa3b2; }
   .model-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
   .model-row label { color: #9aa3b2; font-size: 0.85rem; letter-spacing: 0.02em; }
-  .model-row select { min-width: 16rem; max-width: 100%; }
+  .model-row select { flex: 1 1 16rem; min-width: 0; max-width: 100%; }
   .quick { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem; }
   .quick button { margin: 0; }
   .chat { display: grid; gap: 0.75rem; margin-bottom: 0.75rem; min-width: 0; }
   .chat-line { display: grid; gap: 0.2rem; padding: 0.5rem 0.75rem; border-radius: 2px; background: #171b22; min-width: 0; }
   .chat-line strong { color: #9aa3b2; font-size: 0.8rem; }
-  .chat-line span { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .chat-line span { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }
   .chat-line.assistant { border-left: 3px solid #2563eb; }
   .objective { display: grid; gap: 0.4rem; margin-bottom: 0.75rem; min-width: 0; }
   .objective label, .draft-label { color: #cbd5e1; font-size: 0.9rem; letter-spacing: 0.02em; }
@@ -1414,16 +1436,16 @@ const styles = `
   .route-form { display: flex; flex-wrap: wrap; gap: 0.5rem; min-width: 0; }
   .route-form input { flex: 1 1 18rem; min-width: 0; }
   .route-form button { margin: 0; }
-  .route-panel .meta { margin: 0; font-size: 0.85rem; }
+  .route-panel .meta { margin: 0; font-size: 0.85rem; overflow-wrap: anywhere; word-break: break-word; }
   .chat-form textarea { width: 100%; min-width: 0; resize: vertical; }
   .chat-actions { display: flex; justify-content: flex-end; }
   .chat-actions button { margin: 0; }
   .pending { display: grid; gap: 0.75rem; margin-bottom: 0.75rem; min-width: 0; }
   .pending-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
   .pending-head button { margin: 0; }
-  .pending-card { display: grid; gap: 0.5rem; padding: 0.75rem; border: 1px solid #3a4150; border-radius: 2px; min-width: 0; }
+  .pending-card { display: grid; gap: 0.5rem; padding: 0.75rem; border: 1px solid #3a4150; border-radius: 2px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
   .pending-title { color: #fcd34d; overflow-wrap: anywhere; }
-  .pending-args { margin: 0; padding: 0.5rem; border-radius: 2px; background: #171b22; white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+  .pending-args { margin: 0; padding: 0.5rem; border-radius: 2px; background: #171b22; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }
   .draft-label { display: grid; gap: 0.35rem; }
   .draft-label textarea { width: 100%; min-width: 0; resize: vertical; }
   .pending-buttons { display: flex; gap: 0.5rem; }
@@ -1431,11 +1453,11 @@ const styles = `
   .progress { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.75rem; margin-bottom: 0.75rem; border: 1px solid #2563eb; border-radius: 2px; background: #171b22; min-width: 0; }
   .progress-text { display: grid; gap: 0.25rem; min-width: 0; }
   .progress-text strong { color: #93c5fd; overflow-wrap: anywhere; }
-  .progress-text .meta { font-size: 0.85rem; }
+  .progress-text .meta { font-size: 0.85rem; overflow-wrap: anywhere; word-break: break-word; }
   .progress button { margin: 0; flex-shrink: 0; }
   .retry-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
   .retry-row button { margin: 0; }
   dl { display: grid; grid-template-columns: 9rem minmax(0, 1fr); gap: 0.4rem 1rem; margin: 0; }
   dt { color: #9aa3b2; }
-  dd { margin: 0; overflow-wrap: anywhere; }
+  dd { margin: 0; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
 `;
