@@ -17,6 +17,15 @@ npm run dev
 
 `npm run build` type-checks and produces `dist/`.
 
+## Deploy
+
+```sh
+set -a; . ./.env.local; set +a
+npx vercel@latest --prod --yes
+```
+
+The OIDC token in `.env.local` is the only CLI auth on this machine; without sourcing it the CLI has no login. Git pushes do not auto-deploy yet — run `npx vercel@latest git connect` to enable that.
+
 ## Auth flow
 
 Clerk signs the human into this app only. SpaceMolt has its own login, so no SpaceMolt username/password is requested for existing pilots:
