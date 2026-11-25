@@ -1,4 +1,4 @@
-# SpaceMolt Agent UI
+# Pocket Web SpaceMolt Client
 
 Vite + React + TypeScript frontend for the deployed SpaceMolt agent backend. It authenticates the human with Clerk, connects a pilot through SpaceMolt's browser login, and then lets the human talk to a backend agent that prefers active missions, then a pilot-defined objective, through registered safe actions and approval-gated proposals.
 
@@ -35,7 +35,7 @@ Clerk signs the human into this app only. SpaceMolt has its own login, so no Spa
 3. The UI polls the backend until approval, then shows the observation and enables **Pilot chat**. No password, username, or SpaceMolt token is handled by this app.
 4. To create a new pilot, choose **Create pilot with registration code**, enter a username, empire, and the code from `https://spacemolt.com/dashboard`. The generated password is shown once - save it.
 
-All transient links, codes, generated passwords and the SpaceMolt `sessionId` live only in component state. Only the chosen LLM provider/model are saved in `localStorage`, so they survive reloads; saved values that are no longer offered fall back to the server default. A Clerk JWT is never sent to SpaceMolt.
+All transient links, codes, generated passwords and the SpaceMolt `sessionId` live only in component state. Only the chosen LLM provider/model are saved in `localStorage`, so they survive reloads; saved values that are no longer offered fall back to the server default. The restored selection is sent with registration and login-link approval polling, so the auth proposal uses the same model as chat. A Clerk JWT is never sent to SpaceMolt.
 
 ## Pilot chat
 
@@ -44,13 +44,15 @@ After connecting, the chat section sends messages to `POST /api/chat` with the i
 Quick prompts cover the basic loop:
 
 - **Where am I?** - read status and ask for a next step
-- **Mine here** - travel/mine when at a resource POI
+- **Mine here** - travel/mine when at a resource POI; use **Action loop** below for repeated mining
 - **Dock, sell & refuel** - return to station, sell cargo, refuel
 
 Type free-form requests too, e.g. `check my system for ore and tell me the best route`. The agent knows the SpaceMolt game loop, tool IDs and in-game skill levels from server-provided state; it does not invent IDs or skill unlocks.
 
 For multi-jump travel the agent calls `find_route` once and the UI normalizes its steps into a route plan. The **Multi-jump route** form can also find a route directly by destination id. **Follow route** then jumps step by step in the background, waits for each arrival through `POST /api/location`, and finishes with a local `travel` to the target POI/base when the route has one; it does not spawn a subagent or keep a server-side job running.
  The backend acknowledges long `jump`/`travel` calls with `pending: true` after 45 seconds, and the UI also treats a lost or timed-out response as "submitted, verify by location" instead of a failed jump. Each step advances only after the current system/POI actually matches the step target. The current step, completion state and retry state are shown in chat. **Interrupt** stops the local loop, and **Retry last request** restarts the full plan, skipping steps the pilot has already reached.
+
+**Action loop** repeats a safe action locally through `POST /api/action`. The **Mine here** preset mines the current POI once per SpaceMolt tick with an 11-second delay and stops early on an empty deposit or full cargo; other presets cover survey, self refuel and self repair. **Custom safe action** accepts any registered safe `tool`, `action` and JSON `args`. **Prepare loop** validates the form, **Start loop** runs it in the background with an abortable delay, **Interrupt** stops it, and **Retry last request** resumes from the failed repetition. Approval-gated actions are refused by the backend and stay in the approval-card workflow. Long mining, survey and self-service refuel/repair calls also get `pending: true` after 45 seconds, so a slow SpaceMolt response is not reported as a failed loop iteration.
 
 Approval cards show the exact `tool/action/args` and reason before anything sensitive happens. Text actions also show an editable text box; the pilot can revise the draft and click **Approve & send**, which sends that exact edited text to `POST /api/execute`. Decline discards the proposal locally. Combat, hunting, faction and mission writes, passengers, crafting, freight, gifts, trades, chat, forum posts and petitions all require approval.
 

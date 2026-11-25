@@ -14,6 +14,13 @@ import {
   type TransitLocation,
 } from "./route.js";
 import { loadLlmSelection, resolveLlmSelection, saveLlmModel, saveLlmProvider } from "./preferences.js";
+import {
+  LOOP_PRESETS,
+  loopActionLabel,
+  loopStopReason,
+  parseLoopArgs,
+  type LoopPlan,
+} from "./loop.js";
 
 const BACKEND_URL = (
   import.meta.env.VITE_BACKEND_URL ||
@@ -57,7 +64,8 @@ type RetryRequest =
   | { kind: "chat"; message: string }
   | { kind: "execute"; actions: PendingAction[] }
   | { kind: "action"; tool: string; action: string; args: Record<string, unknown> }
-  | { kind: "route"; plan: RoutePlan };
+  | { kind: "route"; plan: RoutePlan }
+  | { kind: "loop"; plan: LoopPlan; iteration: number };
 
 type RoutePlan = {
   destination: string;
@@ -78,7 +86,16 @@ type RouteRun = {
   error?: string;
 };
 
+type LoopRun = {
+  plan: LoopPlan;
+  iteration: number;
+  status: "running" | "stopped" | "done" | "error";
+  error?: string;
+  stoppedReason?: string;
+};
+
 const MAX_CHAT_HISTORY = 20;
+const DEFAULT_LOOP_PRESET = LOOP_PRESETS.find((preset) => preset.id === "mine") ?? LOOP_PRESETS[0];
 
 function trimChatHistory(history: ChatMessage[]): ChatMessage[] {
   const recent = history.slice(-MAX_CHAT_HISTORY);
@@ -93,6 +110,7 @@ type GameActionRecord = {
   action: string;
   args: Record<string, unknown>;
   ok: boolean;
+  pending?: boolean;
   result?: string;
   structured?: unknown;
   error?: string;
@@ -319,7 +337,8 @@ function actionLabel(action: GameActionRecord): string {
   const args = Object.entries(action.args ?? {})
     .map(([key, value]) => `${key}=${safeText(value)}`)
     .join(", ");
-  return `${action.ok ? "ok" : "failed"} ${safeText(action.action)}${args ? ` (${args})` : ""}`;
+  const status = action.pending ? "submitted" : action.ok ? "ok" : "failed";
+  return `${status} ${safeText(action.action)}${args ? ` (${args})` : ""}`;
 }
 
 function parsePendingActions(value: unknown): PendingAction[] {
@@ -417,6 +436,16 @@ export default function App() {
   const [routePlan, setRoutePlan] = useState<RoutePlan | null>(null);
   const [routeRun, setRouteRun] = useState<RouteRun | null>(null);
   const [routeBusy, setRouteBusy] = useState(false);
+  const [loopPreset, setLoopPreset] = useState(DEFAULT_LOOP_PRESET.id);
+  const [loopTool, setLoopTool] = useState(DEFAULT_LOOP_PRESET.tool);
+  const [loopAction, setLoopAction] = useState(DEFAULT_LOOP_PRESET.action);
+  const [loopArgs, setLoopArgs] = useState(DEFAULT_LOOP_PRESET.args);
+  const [loopRepetitions, setLoopRepetitions] = useState(DEFAULT_LOOP_PRESET.repetitions);
+  const [loopDelay, setLoopDelay] = useState(DEFAULT_LOOP_PRESET.delaySeconds);
+  const [loopStopOnNoProgress, setLoopStopOnNoProgress] = useState(DEFAULT_LOOP_PRESET.stopOnNoProgress);
+  const [loopPlan, setLoopPlan] = useState<LoopPlan | null>(null);
+  const [loopRun, setLoopRun] = useState<LoopRun | null>(null);
+  const [loopBusy, setLoopBusy] = useState(false);
   const [providerChoices, setProviderChoices] = useState<ProviderChoice[]>([]);
   const [selectedProvider, setSelectedProvider] = useState("");
   const [defaultProvider, setDefaultProvider] = useState("");
@@ -484,6 +513,8 @@ export default function App() {
           body: JSON.stringify({
             linkSessionId: link.linkSessionId,
             deviceCode: link.deviceCode,
+            provider: selectedProvider || defaultProvider || undefined,
+            model: selectedModel || undefined,
           }),
         }) as PollResponse;
 
@@ -518,7 +549,7 @@ export default function App() {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [link]);
+  }, [link, selectedProvider, defaultProvider, selectedModel]);
 
   const register = useCallback(async () => {
     setBusy(true);
@@ -539,6 +570,8 @@ export default function App() {
           username: cleanUsername,
           empire,
           registrationCode: cleanCode,
+          provider: selectedProvider || defaultProvider || undefined,
+          model: selectedModel || undefined,
         }),
       });
       const connected = data as unknown as ConnectResult;
@@ -549,7 +582,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [username, empire, registrationCode]);
+  }, [username, empire, registrationCode, selectedProvider, defaultProvider, selectedModel]);
 
   const beginTask = useCallback((label: string) => {
     abortRef.current?.abort();
@@ -558,6 +591,7 @@ export default function App() {
     setTask({ label, startedAt: Date.now() });
     setElapsed(0);
     setTracking(true);
+    setLoopBusy(false);
     return controller;
   }, []);
 
@@ -567,7 +601,9 @@ export default function App() {
     setTask(null);
     setChatBusy(false);
     setApprovalBusy(false);
+    setLoopBusy(false);
     setRouteRun((current) => current?.status === "running" ? { ...current, status: "stopped" } : current);
+    setLoopRun((current) => current?.status === "running" ? { ...current, status: "stopped" } : current);
     setChatHistory((current) => trimChatHistory([...current, {
       role: "assistant",
       content: "Interrupted locally — stopped waiting here. Anything already sent to SpaceMolt may still complete.",
@@ -965,6 +1001,128 @@ export default function App() {
     }
   }, [sessionId, beginTask]);
 
+  const buildLoopPlan = useCallback((): LoopPlan => {
+    const action = loopAction.trim();
+    if (!action) throw new Error("Enter an action to repeat.");
+    const parsed = parseLoopArgs(loopArgs);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const repetitions = Number(loopRepetitions);
+    if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 500) {
+      throw new Error("Repetitions must be an integer from 1 to 500.");
+    }
+    const delaySeconds = Number(loopDelay);
+    if (!Number.isFinite(delaySeconds) || delaySeconds < 0 || delaySeconds > 600) {
+      throw new Error("Delay must be between 0 and 600 seconds.");
+    }
+    const preset = LOOP_PRESETS.find((entry) => entry.id === loopPreset);
+    return {
+      name: preset && preset.id !== "custom" ? preset.label : loopActionLabel(loopTool, action),
+      tool: loopTool.trim() || "spacemolt",
+      action,
+      args: parsed.args,
+      repetitions,
+      delaySeconds,
+      stopOnNoProgress: loopStopOnNoProgress,
+    };
+  }, [loopAction, loopArgs, loopDelay, loopPreset, loopRepetitions, loopStopOnNoProgress, loopTool]);
+
+  const startLoop = useCallback(async (plan: LoopPlan, startIteration = 0) => {
+    if (!sessionId) return;
+    const first = Math.max(0, Math.min(
+      Number.isInteger(startIteration) ? startIteration : 0,
+      plan.repetitions - 1,
+    ));
+    const controller = beginTask(`${loopActionLabel(plan.tool, plan.action)} × ${plan.repetitions}`);
+    setLoopBusy(true);
+    setChatError("");
+    setLoopRun({ plan, iteration: first, status: "running" });
+    setRetryRequest({ kind: "loop", plan, iteration: first });
+    const label = loopActionLabel(plan.tool, plan.action);
+    const append = (content: string) => {
+      setChatHistory((current) => trimChatHistory([...current, { role: "assistant", content }]));
+    };
+    let iteration = first;
+    let stoppedReason: string | null = null;
+
+    try {
+      for (let index = first; index < plan.repetitions; index += 1) {
+        let outcomeText = "";
+        let failed = false;
+
+        try {
+          const data = await readJson(`${BACKEND_URL}/api/action`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId, tool: plan.tool, action: plan.action, args: plan.args }),
+            signal: controller.signal,
+          });
+          const record = data.action as GameActionRecord | undefined;
+          const submitted = data.pending === true || record?.pending === true;
+          if (record?.ok === false && !submitted) {
+            failed = true;
+            outcomeText = safeText(record.error ?? record.result ?? "SpaceMolt refused the action.");
+          } else {
+            outcomeText = `${safeText(record?.result ?? "")} ${record?.structured === undefined ? "" : safeText(record.structured)}`.trim();
+            if (submitted && !outcomeText) outcomeText = "Action submitted; still in progress.";
+          }
+        } catch (err) {
+          if (isAbortError(err)) throw err;
+          const messageText = err instanceof Error ? err.message : String(err);
+          if (err instanceof HttpError && isDefiniteRequestFailure(err.status)) {
+            failed = true;
+            outcomeText = messageText;
+          } else {
+            outcomeText = `Request did not return cleanly (${messageText}); treating it as submitted.`;
+          }
+        }
+
+        if (failed) throw new Error(outcomeText || "SpaceMolt refused the action.");
+        iteration = index + 1;
+        setLoopRun({ plan, iteration, status: "running" });
+        append(`Loop ${iteration}/${plan.repetitions} · ${label}: ${outcomeText || "submitted"}`);
+
+        if (plan.stopOnNoProgress) {
+          const reason = loopStopReason(outcomeText);
+          if (reason) {
+            stoppedReason = reason;
+            break;
+          }
+        }
+
+        if (index + 1 < plan.repetitions && plan.delaySeconds > 0) {
+          await delay(plan.delaySeconds * 1000, controller.signal);
+        }
+      }
+
+      if (abortRef.current === controller) {
+        append(stoppedReason
+          ? `Loop stopped after ${iteration}/${plan.repetitions}: ${stoppedReason}.`
+          : `Loop complete: ${plan.repetitions} × ${label}.`);
+        setLoopRun({ plan, iteration, status: "done", stoppedReason: stoppedReason ?? undefined });
+        setRetryRequest(null);
+        setTask(null);
+        setTracking(false);
+        setChatBusy(false);
+        setLoopBusy(false);
+        abortRef.current = null;
+      }
+    } catch (err) {
+      if (isAbortError(err)) return;
+      const messageText = err instanceof Error ? err.message : String(err);
+      setChatError(messageText);
+      if (abortRef.current === controller) {
+        append(`Loop stopped at repetition ${iteration + 1}/${plan.repetitions}: ${messageText}`);
+        setLoopRun({ plan, iteration, status: "error", error: messageText });
+        setRetryRequest({ kind: "loop", plan, iteration });
+        setTask(null);
+        setTracking(false);
+        setChatBusy(false);
+        setLoopBusy(false);
+        abortRef.current = null;
+      }
+    }
+  }, [sessionId, beginTask]);
+
   const retry = useCallback(() => {
     const request = retryRequest;
     if (!request || !sessionId) return;
@@ -972,15 +1130,23 @@ export default function App() {
     if (request.kind === "chat") void submitChat(request.message);
     else if (request.kind === "execute") void approveActions(request.actions);
     else if (request.kind === "route") void startRoute(request.plan);
+    else if (request.kind === "loop") void startLoop(request.plan, request.iteration);
     else void runAction(request.tool, request.action, request.args);
-  }, [retryRequest, sessionId, submitChat, approveActions, startRoute, runAction]);
+  }, [retryRequest, sessionId, submitChat, approveActions, startRoute, startLoop, runAction]);
+
+  const selectedLoopPreset = LOOP_PRESETS.find((preset) => preset.id === loopPreset) ?? DEFAULT_LOOP_PRESET;
 
   return (
     <>
       <style>{styles}</style>
       <main>
         <header>
-          <h1>SpaceMolt Observer</h1>
+          <div className="brand">
+            <h1>Pocket Web SpaceMolt Client</h1>
+            <p className="meta attribution">
+              <a href="https://wcgw.world/" target="_blank" rel="noreferrer">By WCGW Software</a>
+            </p>
+          </div>
           <Show when="signed-out">
             <SignInButton mode="modal">
               <button type="button">Sign in</button>
@@ -1227,6 +1393,43 @@ export default function App() {
                 </div>
               )}
 
+              <form
+                className="chat-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitChat(chatInput);
+                }}
+              >
+                <label className="ask-label" htmlFor="agent-message">Ask the agent</label>
+                <textarea
+                  id="agent-message"
+                  value={chatInput}
+                  onChange={(event) => setChatInput(event.target.value)}
+                  rows={3}
+                  placeholder="Check status, travel, mine, dock, sell, refuel…"
+                />
+                <div className="chat-actions">
+                  <button type="submit" disabled={chatBusy || !chatInput.trim()}>
+                    {chatBusy ? "Thinking…" : "Send"}
+                  </button>
+                </div>
+              </form>
+              {chatError && <p className="error">{chatError}</p>}
+              {retryRequest && !task && (
+                <div className="retry-row">
+                  <button type="button" className="secondary" onClick={retry}>
+                    Retry last request
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => setRetryRequest(null)}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
               {(task || tracking) && (
                 <div className="progress">
                   <div className="progress-text">
@@ -1288,6 +1491,138 @@ export default function App() {
                 )}
               </div>
 
+              <div className="route-panel loop-panel">
+                <label className="ask-label" htmlFor="loop-preset">Action loop</label>
+                <div className="loop-grid">
+                  <label>
+                    Preset
+                    <select
+                      id="loop-preset"
+                      value={loopPreset}
+                      disabled={chatBusy || loopBusy}
+                      onChange={(event) => {
+                        const preset = LOOP_PRESETS.find((entry) => entry.id === event.target.value);
+                        if (!preset) return;
+                        setLoopPreset(preset.id);
+                        setLoopTool(preset.tool);
+                        setLoopAction(preset.action);
+                        setLoopArgs(preset.args);
+                        setLoopRepetitions(preset.repetitions);
+                        setLoopDelay(preset.delaySeconds);
+                        setLoopStopOnNoProgress(preset.stopOnNoProgress);
+                        setLoopPlan(null);
+                        setLoopRun(null);
+                      }}
+                    >
+                      {LOOP_PRESETS.map((preset) => (
+                        <option key={preset.id} value={preset.id}>{preset.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Tool
+                    <input
+                      value={loopTool}
+                      disabled={chatBusy || loopBusy}
+                      onChange={(event) => setLoopTool(event.target.value)}
+                      placeholder="spacemolt"
+                    />
+                  </label>
+                  <label>
+                    Action
+                    <input
+                      value={loopAction}
+                      disabled={chatBusy || loopBusy}
+                      onChange={(event) => setLoopAction(event.target.value)}
+                      placeholder="mine"
+                    />
+                  </label>
+                  <label>
+                    Repetitions
+                    <input
+                      type="number"
+                      min={1}
+                      max={500}
+                      value={loopRepetitions}
+                      disabled={chatBusy || loopBusy}
+                      onChange={(event) => setLoopRepetitions(Number(event.target.value))}
+                    />
+                  </label>
+                  <label>
+                    Delay (seconds)
+                    <input
+                      type="number"
+                      min={0}
+                      max={600}
+                      value={loopDelay}
+                      disabled={chatBusy || loopBusy}
+                      onChange={(event) => setLoopDelay(Number(event.target.value))}
+                    />
+                  </label>
+                  <label className="loop-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={loopStopOnNoProgress}
+                      disabled={chatBusy || loopBusy}
+                      onChange={(event) => setLoopStopOnNoProgress(event.target.checked)}
+                    />
+                    Stop on empty deposit or full cargo
+                  </label>
+                  <label className="loop-args">
+                    Arguments (JSON)
+                    <textarea
+                      rows={2}
+                      value={loopArgs}
+                      disabled={chatBusy || loopBusy}
+                      onChange={(event) => setLoopArgs(event.target.value)}
+                      placeholder="{}"
+                    />
+                  </label>
+                </div>
+                <p className="meta">
+                  {selectedLoopPreset.help} Runs safe actions only through the direct action endpoint.
+                </p>
+                <div className="route-form">
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={chatBusy || loopBusy}
+                    onClick={() => {
+                      try {
+                        setLoopPlan(buildLoopPlan());
+                        setLoopRun(null);
+                        setChatError("");
+                      } catch (err) {
+                        setChatError(err instanceof Error ? err.message : String(err));
+                      }
+                    }}
+                  >
+                    Prepare loop
+                  </button>
+                  <button
+                    type="button"
+                    disabled={chatBusy || loopBusy || !loopPlan}
+                    onClick={() => { if (loopPlan) void startLoop(loopPlan); }}
+                  >
+                    {loopBusy ? "Running…" : "Start loop"}
+                  </button>
+                </div>
+                {loopPlan && (
+                  <p className="meta">
+                    Loop ready: {loopActionLabel(loopPlan.tool, loopPlan.action)} × {loopPlan.repetitions}
+                    {loopPlan.delaySeconds > 0 ? ` · every ${loopPlan.delaySeconds}s` : " · no delay"}
+                    {loopPlan.stopOnNoProgress ? " · stops on empty deposit or full cargo" : ""}
+                  </p>
+                )}
+                {loopRun && (
+                  <p className="meta">
+                    Loop status: {loopRun.status} · repetition {loopRun.iteration}/{loopRun.plan.repetitions}
+                    {loopRun.stoppedReason ? ` · ${loopRun.stoppedReason}` : ""}
+                    {loopRun.error ? ` · ${loopRun.error}` : ""}
+                  </p>
+                )}
+              </div>
+
               {pendingActions.length > 0 && (
                 <div className="pending">
                   <div className="pending-head">
@@ -1345,42 +1680,6 @@ export default function App() {
                 </div>
               )}
 
-              <form
-                className="chat-form"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void submitChat(chatInput);
-                }}
-              >
-                <label className="ask-label" htmlFor="agent-message">Ask the agent</label>
-                <textarea
-                  id="agent-message"
-                  value={chatInput}
-                  onChange={(event) => setChatInput(event.target.value)}
-                  rows={3}
-                  placeholder="Check status, travel, mine, dock, sell, refuel…"
-                />
-                <div className="chat-actions">
-                  <button type="submit" disabled={chatBusy || !chatInput.trim()}>
-                    {chatBusy ? "Thinking…" : "Send"}
-                  </button>
-                </div>
-              </form>
-              {chatError && <p className="error">{chatError}</p>}
-              {retryRequest && !task && (
-                <div className="retry-row">
-                  <button type="button" className="secondary" onClick={retry}>
-                    Retry last request
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary"
-                    onClick={() => setRetryRequest(null)}
-                  >
-                    Dismiss
-                  </button>
-                </div>
-              )}
             </section>
           )}
         </Show>
@@ -1400,6 +1699,7 @@ const styles = `
   body { margin: 0; }
   main { max-width: 46rem; margin: 3rem auto; padding: 0 1rem; min-width: 0; overflow-wrap: anywhere; }
   header, .row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-width: 0; }
+  .brand { display: grid; gap: 0.25rem; min-width: 0; }
   h1 { font-size: 1.6rem; font-weight: 600; letter-spacing: 0.015em; }
   h2 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.015em; }
   section { margin-top: 1.5rem; padding: 1rem; border: 1px solid #2a2f38; border-radius: 3px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
@@ -1416,6 +1716,7 @@ const styles = `
   .error { color: #fca5a5; }
   .notice { color: #fcd34d; }
   .meta { color: #9aa3b2; }
+  .attribution { margin: 0; text-align: left; font-size: 0.85rem; }
   .model-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
   .model-row label { color: #9aa3b2; font-size: 0.85rem; letter-spacing: 0.02em; }
   .model-row select { flex: 1 1 16rem; min-width: 0; max-width: 100%; }
@@ -1437,6 +1738,13 @@ const styles = `
   .route-form input { flex: 1 1 18rem; min-width: 0; }
   .route-form button { margin: 0; }
   .route-panel .meta { margin: 0; font-size: 0.85rem; overflow-wrap: anywhere; word-break: break-word; }
+  .loop-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; min-width: 0; }
+  .loop-grid label { display: grid; align-content: start; gap: 0.35rem; color: #9aa3b2; min-width: 0; }
+  .loop-grid input, .loop-grid select, .loop-grid textarea { width: 100%; min-width: 0; }
+  .loop-grid textarea { resize: vertical; }
+  .loop-grid .loop-checkbox { display: flex; align-items: center; gap: 0.5rem; }
+  .loop-grid .loop-checkbox input { width: auto; }
+  .loop-grid .loop-args { grid-column: 1 / -1; }
   .chat-form textarea { width: 100%; min-width: 0; resize: vertical; }
   .chat-actions { display: flex; justify-content: flex-end; }
   .chat-actions button { margin: 0; }
